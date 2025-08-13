@@ -202,7 +202,7 @@ class GraphEpsDenoiser(nn.Module):
         t = t.to(dtype=model_dtype, device=device)
 
         t_emb = sinusoidal_timestep_embedding(t.flatten(), self.time_dim)  # [B, time_dim] or [1, time_dim]
-        t_emb = t_emb.mean(dim=0, keepdim=True)                            # [1, time_dim]
+        # t_emb = t_emb.mean(dim=0, keepdim=True)                            # [1, time_dim]
         t_emb = self.t_mlp(t_emb)                                          # [1, time_dim]
 
         # 3) Node encoder
