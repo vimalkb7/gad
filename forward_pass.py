@@ -4,6 +4,7 @@ import numpy as np
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
 import networkx as nx
+import math
 
 torch.set_printoptions(threshold=float('inf'))
 
@@ -22,7 +23,7 @@ def sample_x0_from_gmm_single(n_nodes: int, d_feat: int,
                               weights=np.array([0.3, 0.4, 0.3]),
                               means=np.array([-5.0, 0.0, 4.0]),
                               stds=np.array([1.0, 0.8, 1.2]),
-                              seed: int = None) -> torch.Tensor:
+                              seed: int = 42) -> torch.Tensor:
     if seed is not None:
         np.random.seed(seed)
     K = len(weights)
@@ -44,14 +45,14 @@ def forward_diffusion_exact(
     c: float,
     gamma: float,
     sigma: float,
+    return_trajectory: bool = False,
 ):
     """
-    Exact Δt discretization per step:
-      x_{k+1} = tilde_alpha x_k + B_delta z_k,
-      tilde_alpha = expm(-c L_gamma Δt),
-      alpha       = tilde_alpha @ tilde_alpha,
-      Sigma_delta = sigma^2 * (I - alpha) @ L_gamma^{-1},
-      B_delta B_delta^T = Sigma_delta.
+    Exact Δt discretization per step (precomputes operators),
+    but *evolves* with the equivalent Euler–Maruyama SDE:
+        x_{k+1} = x_k + dt * (-c L_gamma x_k) + sqrt(2c)*sigma*sqrt(dt)*z_k
+    Also returns the one-step exact matrices for theory checks.
+    If return_trajectory=True, returns the whole path [T+1, N, D].
     """
     assert X_sub.dim() == 2, "X_sub must be [N, D]"
     N, D = X_sub.shape
@@ -66,30 +67,158 @@ def forward_diffusion_exact(
     L_gamma = L + gamma * I
 
     dt = 1.0 / T
+    # dt = 0.0002
+    G = sigma * math.sqrt(2.0 * c)
 
-    # Exact one-step matrices (matrix exponential)
+    # Precompute exact one-step matrices for theory
     tilde_alpha = torch.matrix_exp(-c * L_gamma * dt)        # [N,N]
     alpha       = tilde_alpha @ tilde_alpha                  # [N,N]
+    Sigma_delta = sigma**2 * torch.linalg.solve(L_gamma, (I - alpha))  # [N,N]
 
-    # Sigma_delta = sigma^2 * (I - alpha) @ L_gamma^{-1}
-    # Use linear solve for stability
-    Sigma_delta = sigma**2 * torch.linalg.solve(L_gamma, (I - alpha))
-
-    # Cholesky for B_delta (lower)
-    S = 0.5 * (Sigma_delta + Sigma_delta.T)  # symmetrize
-    try:
-        B_delta = torch.linalg.cholesky(S, upper=False)
-    except RuntimeError:
-        eps = 1e-6 * torch.trace(S) / N
-        B_delta = torch.linalg.cholesky(S + eps * I, upper=False)
-
-    # Iterate
+    # Simulate trajectory with EM (matches continuous SDE)
     x = X_sub.clone()
-    for _ in range(T):
-        z = torch.randn(N, D, device=device, dtype=dtype)
-        x = tilde_alpha @ x + B_delta @ z
+    if return_trajectory:
+        traj = torch.empty(T + 1, N, D, dtype=dtype, device=device)
+        traj[0] = x
 
-    return x, (L, L_gamma, tilde_alpha, alpha, Sigma_delta)
+    for k in range(T):
+        z = torch.randn(N, D, device=device, dtype=dtype)
+        x = x + (-c * (L_gamma @ x)) * dt + (G * math.sqrt(dt) * z)
+        if return_trajectory:
+            traj[k + 1] = x
+
+    if return_trajectory:
+        return traj, (L, L_gamma, tilde_alpha, alpha, Sigma_delta)
+    else:
+        return x, (L, L_gamma, tilde_alpha, alpha, Sigma_delta)
+
+
+
+# ------------------------------------------------------------
+# Helper function for graph plots
+# ------------------------------------------------------------
+
+
+
+def empirical_mean_and_cov_over_samples(X_batch: torch.Tensor):
+    """
+    X_batch: [R, N, D] for a *fixed timestep k* (R trajectories)
+    Returns:
+      mean_k: [N, D]
+      cov_k : [N, N]  (pooling features as i.i.d. replicates)
+    """
+    R, N, D = X_batch.shape
+    mean_k = X_batch.mean(dim=0)  # [N, D]
+
+    # Pool features as additional i.i.d. replicates for a stable node covariance
+    X_flat = X_batch.permute(0, 2, 1).reshape(R * D, N)      # [R*D, N]
+    X_centered = X_flat - X_flat.mean(dim=0, keepdim=True)
+    cov_k = (X_centered.T @ X_centered) / (R * D - 1)        # [N, N]
+    cov_k = 0.5 * (cov_k + cov_k.T)
+    return mean_k, cov_k
+
+
+def compute_time_series_errors_against_final(
+    trajectories: torch.Tensor,           # [R, T+1, N, D]
+    L_gamma: torch.Tensor,
+    alpha: torch.Tensor,
+    sigma: float,
+    T: int,
+    out_dir: str = "."
+) -> dict:
+    """
+    For each timestep k=0..T, compute empirical mean & covariance across R samples,
+    then compare to the *theoretical target at final step T only*:
+        μ_T = 0                                (assuming x0 = 0)
+        Σ_T = sigma^2 * (I - alpha^T) @ L_gamma^{-1}
+    Saves plots:
+      - mean_error_vs_time.png
+      - cov_fro_error_vs_time.png
+    """
+    device, dtype = trajectories.device, trajectories.dtype
+    R, TP1, N, D = trajectories.shape
+    assert TP1 == T + 1
+
+    I = torch.eye(N, device=device, dtype=dtype)
+    alpha_T = torch.linalg.matrix_power(alpha, T)
+    Sigma_T = sigma**2 * torch.linalg.solve(L_gamma, (I - alpha_T))
+    Sigma_T = 0.5 * (Sigma_T + Sigma_T.T)
+
+    # μ_T = 0 when x0 = 0
+    mu_T = torch.zeros(N * D, device=device, dtype=dtype)
+
+    mean_err_l2 = np.zeros(TP1)
+    cov_err_fro  = np.zeros(TP1)
+    cov_err_rel  = np.zeros(TP1)
+
+    Sigma_T_fro = torch.norm(Sigma_T, p='fro') + 1e-12
+
+    for k in range(TP1):
+        Xk = trajectories[:, k]                     # [R, N, D]
+        mean_k, cov_k = empirical_mean_and_cov_over_samples(Xk)
+
+        # mean error vs μ_T = 0
+        mean_diff = mean_k.reshape(-1) - mu_T
+        mean_err_l2[k] = float(torch.norm(mean_diff, p=2).item())
+
+        # covariance Fro error vs Σ_T
+        cov_diff = (cov_k - Sigma_T)
+        fro = torch.norm(cov_diff, p='fro')
+        cov_err_fro[k] = float(fro.item())
+        cov_err_rel[k] = float((fro / Sigma_T_fro).item())
+
+
+    # --- Plots ---
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Build a clean param string once
+    param_str = f"T={T}, c={c:.3g}, γ={float(L_gamma.diag().mean().sub((L_gamma - torch.diag(L_gamma.diag())).mean()*0)+gamma):.3g}, σ={sigma:.3g}"
+    # ↑ the γ in L_gamma is your scalar `gamma`; shown directly for clarity:
+    param_str = f"T={T}, c={c:.3g}, γ={gamma:.3g}, σ={sigma:.3g}"
+
+    # 1) Mean L2 error vs time
+    plt.figure()
+    plt.plot(np.arange(TP1), mean_err_l2, label=r"$\|\mathbb{E}[\mathbf{x}_k]-\mu_T\|_2$")
+    plt.xlabel("timestep k")
+    plt.ylabel(r"$\|\mathbb{E}[\mathbf{x}_k]-\mu_T\|_2$")
+    plt.title("Mean error vs final theoretical mean (at step T)")
+    plt.legend(title=param_str, loc="best", frameon=True)
+    mean_plot_path = os.path.join(
+        out_dir, f"mean_error_vs_time_T{T}_c{c:.3g}_g{gamma:.3g}_s{sigma:.3g}.png"
+    )
+    plt.tight_layout()
+    plt.savefig(mean_plot_path, dpi=150)
+    plt.close()
+
+    # 2) Covariance Fro and relative Fro vs time
+    plt.figure()
+    plt.plot(np.arange(TP1), cov_err_fro,
+             label=r"$\|\Sigma_k - \Sigma_T\|_F$")
+    plt.plot(np.arange(TP1), cov_err_rel,
+             label=r"$\|\Sigma_k - \Sigma_T\|_F / \|\Sigma_T\|_F$")
+    plt.xlabel("timestep k")
+    plt.ylabel("error")
+    plt.title("Covariance error vs final theoretical covariance (at step T)")
+    plt.legend(title=param_str, loc="best", frameon=True)
+    cov_plot_path = os.path.join(
+        out_dir, f"cov_fro_error_vs_time_T{T}_c{c:.3g}_g{gamma:.3g}_s{sigma:.3g}.png"
+    )
+    plt.tight_layout()
+    plt.savefig(cov_plot_path, dpi=150)
+    plt.close()
+
+
+    return {
+        "mean_err_l2": mean_err_l2,
+        "cov_err_fro": cov_err_fro,
+        "cov_err_rel": cov_err_rel,
+        "mean_plot_path": mean_plot_path,
+        "cov_plot_path": cov_plot_path,
+        "Sigma_T": Sigma_T,
+    }
+
+
 
 # ------------------------------------------------------------
 # Theoretical finite-k covariance Σ_k and check
@@ -154,34 +283,44 @@ if __name__ == "__main__":
     # Config
     n_nodes = 5
     d_feat  = 10
-    R       = 500
+    R       = 100
     seed    = 42
 
-    T     = 600
-    c     = 10.0
+    T     = 10000
+    c     = 2
     gamma = 0.3
-    sigma = 0.5
+    sigma = 6
 
-    # Graph & Laplacian
+    out_dir = "/tudelft.net/staff-bulk/ewi/insy/MMC/vimal/Results/Graph_Aware_Graph_Signal_Diffusion/Forward/Exp15"
+    os.makedirs(out_dir, exist_ok=True)
+
+
+
+    # Graph
     adj  = build_er_graph(n=n_nodes, p_edge=0.5, seed=seed)
-    Dm = torch.diag(adj.sum(dim=1))
-    L  = Dm - adj
 
-    # Generate R terminal samples with the EXACT integrator
-    final_samples = []
-    # Use x0 = 0 so theory (Σ_T) matches the MC exactly
-    X0_zero = torch.zeros((n_nodes, d_feat), dtype=torch.float64)
+
+    X0 = sample_x0_from_gmm_single(n_nodes = n_nodes, d_feat = d_feat)
+
+    # --- Simulate R trajectories, storing all timesteps ---
+    all_traj = []
     cache = None
     for i in range(R):
-        x_T, cache = forward_diffusion_exact(
-            X_sub=X0_zero, A_sub=adj, T=T, c=c, gamma=gamma, sigma=sigma
+        traj_i, cache = forward_diffusion_exact(
+            X_sub=X0, A_sub=adj, T=T, c=c, gamma=gamma, sigma=sigma,
+            return_trajectory=True
         )
-        final_samples.append(x_T)
-        if (i+1) % 50 == 0:
-            print(f"Generated {i+1}/{R} samples")
+        all_traj.append(traj_i)              # [T+1, N, D]
+        if (i + 1) % 50 == 0:
+            print(f"Generated {i+1}/{R} trajectories")
 
-    # Compare distributions (exact formulas)
+    all_traj = torch.stack(all_traj, dim=0)  # [R, T+1, N, D]
+
+    # Unpack theory bits
     _, L_gamma, tilde_alpha, alpha, Sigma_delta = cache
+
+    # --- Your existing final-time check (kept intact) ---
+    final_samples = [all_traj[i, -1] for i in range(R)]      # list of [N,D]
     results = check_distribution_exact(
         final_samples, L_gamma=L_gamma, alpha=alpha, sigma=sigma, T=T
     )
@@ -194,23 +333,32 @@ if __name__ == "__main__":
     print(results['theoretical_cov'])
     print(f"Frobenius norm error (emp vs theory): {results['fro_error']:.4e}")
 
-    # Relative Frobenius error
     rel = torch.norm(results['empirical_cov'] - results['theoretical_cov'], p='fro') / \
           (torch.norm(results['theoretical_cov'], p='fro') + 1e-12)
     print("Relative Frobenius error:", rel.item())
 
-    # Stability of exact one-step operator: ρ(tilde_alpha) < 1
     rho = np.max(np.abs(np.linalg.eigvals(tilde_alpha.detach().cpu().numpy())))
     print("Spectral radius ρ(tilde_alpha):", float(np.real(rho)))
 
-    # KL divergence between Gaussians N(0, Σ_emp) and N(0, Σ_theory)
     Sig_emp = results['empirical_cov'].to(torch.float64).clone()
     Sig_th  = results['theoretical_cov'].to(torch.float64).clone()
     eps = 1e-8
     I = torch.eye(Sig_emp.size(0), dtype=Sig_emp.dtype, device=Sig_emp.device)
     Sig_emp = Sig_emp + eps * I
     Sig_th  = Sig_th  + eps * I
-    k = Sig_emp.size(0)
-    KL = 0.5 * ( torch.trace(torch.linalg.solve(Sig_th, Sig_emp)) - k
+    k_dim = Sig_emp.size(0)
+    KL = 0.5 * ( torch.trace(torch.linalg.solve(Sig_th, Sig_emp)) - k_dim
                  - torch.logdet(Sig_emp) + torch.logdet(Sig_th) )
     print("KL(emp || theory):", KL.item())
+
+    # --- NEW: Time-series error vs final-theoretical stats ---
+    ts_res = compute_time_series_errors_against_final(
+        trajectories=all_traj,
+        L_gamma=L_gamma,
+        alpha=alpha,
+        sigma=sigma,
+        T=T,
+        out_dir=out_dir
+    )
+    print(f"Saved mean error curve to: {ts_res['mean_plot_path']}")
+    print(f"Saved covariance error curves to: {ts_res['cov_plot_path']}")
