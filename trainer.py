@@ -67,7 +67,7 @@ class Trainer(object):
         results_folder: str = './results',
         val_batch_size: int = 1,
         use_steady_state_init: bool = True,
-        dt: float = None,
+        dt: float or bool = None,
     ):
 
         super().__init__()
@@ -89,6 +89,8 @@ class Trainer(object):
         L = (D - adj_t)
 
         self.base_adj = adj_t
+
+        dt = 1.0/timesteps if dt is None else dt
 
         cfg = GraphDDPMSchedule(T=timesteps, dt=dt, c=c, sigma=sigma, gamma=gamma, use_steady_state_init=True)
         # Build diffusion (new API)
@@ -153,6 +155,53 @@ class Trainer(object):
             return torch.tensor(features, dtype=torch.float32, device=device)
         # fallback
         return torch.as_tensor(features, dtype=torch.float32, device=device)
+
+    # -------------------- diagnostics --------------------
+    @torch.no_grad()
+    def noise_sweep_experiment(self, epoch: int = -1, ks = None, num_batches: int = 1):
+        """
+        Diagnostic loop:
+        - take data x0
+        - add noise at level k (forward)
+        - reverse from k→0
+        - collect MSE(x̂0, x0) vs k
+        Saves plot to results folder and prints a compact table.
+        """
+        device = next(self.model.parameters()).device
+        if ks is None:
+            T = self.model.cfg.T
+            ks = sorted({1, max(2, T//100), T//50, T//20, T//10, T//5, T//3, T//2, (3*T)//4, T})
+            ks = [int(k) for k in ks if 1 <= k <= T]
+
+        self.model.eval()
+        mses = torch.zeros(len(ks), dtype=torch.float64)
+        count = 0
+
+        for b_idx, batch in enumerate(self.dl):
+            if b_idx >= num_batches:
+                break
+            x0 = self._as_features_tensor(batch, device)   # [B,N,D]
+            res = self.model.sweep_noisy_reconstruction(x0, self.base_adj, self.model.denoise_fn, ks)
+            mses += res['mse'].to(mses)
+            count += 1
+
+            if b_idx == 0:
+                import matplotlib.pyplot as plt
+                plt.figure()
+                plt.plot(res['k'], res['mse'].cpu().numpy(), marker='o')
+                plt.xlabel('k (timestep)')
+                plt.ylabel('Reconstruction MSE to x0')
+                title_ep = f'epoch {epoch}' if epoch >= 0 else 'diagnostic'
+                plt.title(f'Noisy→denoise sweep — {title_ep}')
+                fig_path = self.results_folder / f'noise_sweep_mse_epoch{epoch if epoch>=0 else "X"}.png'
+                plt.savefig(fig_path, bbox_inches='tight')
+                plt.close()
+
+        mses /= max(1, count)
+        print('[NoiseSweep] k vs MSE:')
+        print(' '.join([f'{k}:{mses[i].item():.5f}' for i, k in enumerate(ks)]))
+        return ks, mses
+
 
     # -------------------- training --------------------
     def train(self):

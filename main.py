@@ -7,8 +7,6 @@ from graph_dataset import build_er_graph
 import torch
 torch.set_default_dtype(torch.float64)
 
-import sys
-sys.stdout.reconfigure(line_buffering=True)
 
 
 def parse_args():
@@ -18,39 +16,39 @@ def parse_args():
     parser.add_argument('--num_nodes', type=int, default=5)
     parser.add_argument('--p_edge', type=float, default=0.5)
     parser.add_argument('--d_feat', type=int, default=10)
-    parser.add_argument('--data_points', type=int, default=1000)
+    parser.add_argument('--data_points', type=int, default=10000)
 
     # Initial Gaussian Mixture Distribution Parameters 
 
-    parser.add_argument('--weights', type=int, nargs=5, default=[0.22, 0.18, 0.27, 0.15, 0.18], help='List of distribution weights')
-    parser.add_argument('--means', type=int, nargs=5, default=[-4.5, -1.0, 0.8, 3.2, 5.5], help='List of distribution means')
-    parser.add_argument('--stds', type=int, nargs=5, default=[0.5, 1.2, 0.4, 0.9, 0.6], help='List of distribution means')
+    parser.add_argument('--weights', type=int, nargs=3, default=[0.3, 0.4, 0.3], help='List of distribution weights')
+    parser.add_argument('--means', type=int, nargs=3, default=[-5.0, 0.0, 4.0], help='List of distribution means')
+    parser.add_argument('--stds', type=int, nargs=3, default=[1.0, 0.8, 1.2], help='List of distribution means')
 
     # Validation Parameters
     parser.add_argument('--val_batch_size', type=int, default=50)
     
     # Model hyperparameters
-    parser.add_argument('--hid', type=int, default=256)
-    parser.add_argument('--depth', type=int, default=6)
-    parser.add_argument('--heads', type=int, default=8)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--hid', type=int, default=128)
+    parser.add_argument('--depth', type=int, default=2)
+    parser.add_argument('--time_dim', type=int, default=128)
+    parser.add_argument('--dropout', type=float, default=0.0)
 
     # Training hyperparameters
     parser.add_argument('--random_seed', type=int, default=42)
-    parser.add_argument('--num_epochs', type=int, default=500)
+    parser.add_argument('--num_epochs', type=int, default=200)
     parser.add_argument('--timesteps', type=int, default=1000)
-    parser.add_argument('--train_batch_size', type=int, default=64)
+    parser.add_argument('--train_batch_size', type=int, default=256)
     parser.add_argument('--train_lr', type=float, default=2e-5)
-    parser.add_argument('--c', type=float, default=0.05)
-    parser.add_argument('--gamma', type=float, default=0.05)
-    parser.add_argument('--sigma', type=float, default=0.05)
-    parser.add_argument('--dt', type=float, default=0.02)
+    parser.add_argument('--c', type=float, default=2)
+    parser.add_argument('--gamma', type=float, default=0.9)
+    parser.add_argument('--sigma', type=float, default=6)
+    parser.add_argument('--dt', type=float or bool, default=None)
     parser.add_argument('--gradient_accumulate_every', type=int, default=1)
     parser.add_argument('--fp16', action='store_true')
-    parser.add_argument('--print_loss_every', type=int, default=2)
-    parser.add_argument('--print_validation', type=int, default=2)
+    parser.add_argument('--print_loss_every', type=int, default=10)
+    parser.add_argument('--print_validation', type=int, default=10)
 
-    parser.add_argument('--results_folder', type=str, default='/Users/vkumarasamybal/Documents/Code/Graph_Aware_Graph_Signal_Diffusion/Results/Exp2')
+    parser.add_argument('--results_folder', type=str, default='/tudelft.net/staff-bulk/ewi/insy/MMC/vimal/Results/Graph_Aware_Graph_Signal_Diffusion/Output_Diagnostics/Exp3')
 
     return parser.parse_args()
 
@@ -59,10 +57,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    print("Arguments:")
+    print("==============================================================================")
+    print(args)
+    print("==============================================================================")
     
     Adj = build_er_graph(args.num_nodes, args.p_edge, args.random_seed)
 
-    model = GraphEpsDenoiser(in_dim=args.d_feat)
+    model = GraphEpsDenoiser(in_dim=args.d_feat, hidden=args.hid, depth=args.depth, time_dim=args.time_dim, dropout=args.dropout)
 
     trainer = Trainer(
         eps_network = model,
@@ -92,6 +95,13 @@ def main():
     )
 
     trainer.train()
+
+    # Run the noise sweep diagnostic after training
+    try:
+        trainer.noise_sweep_experiment(epoch=-1)
+    except Exception as e:
+        print('Noise sweep experiment failed:', e)
+
 
 if __name__ == "__main__":
     main()

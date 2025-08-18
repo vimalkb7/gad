@@ -88,6 +88,7 @@ class GraphGaussianDDPM(nn.Module):
         self.register_buffer("alpha", alpha)
         self.register_buffer("Sigma_delta", Sigma_delta)
         self.register_buffer("B_delta", B_delta)
+        self.register_buffer("eps_num", torch.tensor(1e-12, dtype=L.dtype, device=L.device))
 
         # Precompute powers H_k = tilde_alpha^k and alpha^k
         T = schedule.T
@@ -180,6 +181,44 @@ class GraphGaussianDDPM(nn.Module):
         e_k = torch.einsum("bnm,bmd->bnd", Bk, z)       # [B,N,D]
         x_k = mean + e_k
         return x_k, mean, e_k
+
+    # ------------------------- Diagnostic Functions -------------------------
+    @torch.no_grad()
+    def reverse_from_k(self, xk: torch.Tensor, k: int, eps_model: Optional[nn.Module],
+                    adj: torch.Tensor, deterministic_last: bool=True) -> torch.Tensor:
+        """
+        Reverse DDPM from an intermediate time k back to 0 on a batch.
+        Assumes one integer k for the whole batch.
+        """
+        device = xk.device
+        eps_model = self.denoise_fn if eps_model is None else eps_model
+        for step in reversed(range(1, k + 1)):
+            kk = torch.full((xk.size(0),), step, device=device, dtype=torch.long)
+            add_noise = not (deterministic_last and step == 1)
+            xk = self.p_sample(xk, k=kk, eps_model=eps_model, adj=adj, add_noise=add_noise)
+        return xk
+
+    @torch.no_grad()
+    def sweep_noisy_reconstruction(self, x0: torch.Tensor, adj: torch.Tensor,
+                                eps_model: Optional[nn.Module], ks: list[int]) -> dict:
+        """
+        For each k in ks: sample x_k ~ q(x_k|x_0), then reconstruct \hat{x}_0 by reversing k→0.
+        Returns dict with k, per-k MSE, and the intermediate tensors for inspection.
+        """
+        device = x0.device
+        out = {'k': [], 'mse': [], 'x0_hat_list': [], 'xk_list': []}
+        for k in ks:
+            kk = torch.full((x0.size(0),), k, device=device, dtype=torch.long)
+            xk, _, _ = self.q_sample(x0, kk)
+            x0_hat = self.reverse_from_k(xk, k=k, eps_model=eps_model, adj=adj, deterministic_last=True)
+            mse = torch.mean((x0_hat - x0) ** 2).detach()
+            out['k'].append(k)
+            out['mse'].append(mse)
+            out['x0_hat_list'].append(x0_hat.detach())
+            out['xk_list'].append(xk.detach())
+        if len(out['mse']) > 0:
+            out['mse'] = torch.stack(out['mse'])
+        return out
 
     # ------------------------- Training loss: epsilon prediction -------------------------
     def loss_epsilon_matching(
