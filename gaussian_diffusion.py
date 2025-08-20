@@ -88,6 +88,7 @@ class GraphGaussianDDPM(nn.Module):
         self.register_buffer("alpha", alpha)
         self.register_buffer("Sigma_delta", Sigma_delta)
         self.register_buffer("B_delta", B_delta)
+        self.register_buffer("eps_num", torch.tensor(1e-12, dtype=L.dtype, device=L.device))
 
         # Precompute powers H_k = tilde_alpha^k and alpha^k
         T = schedule.T
@@ -203,6 +204,8 @@ class GraphGaussianDDPM(nn.Module):
 
         eps_model = self.denoise_fn if eps_model is None else eps_model
         eps_hat = eps_model(xk, adj, k)                 # [B,N,D]
+        eps_hat = eps_hat.float()
+        eps = eps.float()
         loss = F.mse_loss(eps_hat, eps)
         return loss
 
