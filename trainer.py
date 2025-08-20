@@ -6,11 +6,14 @@ import sys, os
 from torch import nn
 import torch.nn.functional as F
 from functools import partial
+import numpy as np
+import imageio.v2 as imageio
+
+
 
 from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
-import numpy as np
 import matplotlib.pyplot as plt
 
 from graph_dataset import CommunitySpec, SBMSyntheticDataset
@@ -57,6 +60,7 @@ class Trainer(object):
         random_seed: int = 42,
         num_epochs: int = 100,
         timesteps: int = 1000,
+        train_max_t: int = 50,
         train_batch_size: int = 32,
         train_lr: float = 2e-5,
         c: float = 1.0,
@@ -91,10 +95,11 @@ class Trainer(object):
         L = (D - adj_t)
 
         self.base_adj = adj_t
+        self.train_max_t = train_max_t
 
         dt = 1.0/timesteps if dt is None else dt
 
-        cfg = GraphDDPMSchedule(T=timesteps, dt=dt, c=c, sigma=sigma, gamma=gamma, use_steady_state_init=True)
+        cfg = GraphDDPMSchedule(T=timesteps, dt=dt, c=c, sigma=sigma, gamma=gamma, train_max_t=train_max_t, use_steady_state_init=True)
         # Build diffusion (new API)
         self.model = GraphGaussianDDPM(L, eps_network, cfg)
 
@@ -142,6 +147,11 @@ class Trainer(object):
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
+
+        # fixed validation indices
+        B = min(self.val_batch_size, len(self.ds))
+        g = torch.Generator().manual_seed(self.seed)   # reproducible
+        self.val_indices = torch.randperm(len(self.ds), generator=g)[:B]
 
 
     # -------------------- utilities --------------------
@@ -236,7 +246,13 @@ class Trainer(object):
 
     @torch.no_grad()
     def _sample_validation(self, epoch: int):
+        """
+        Forward clean data to k = self.train_max_t, then run the reverse process
+        back to 0. At a few steps, compare the current (denoised) distribution
+        against the CLEAN x0 using the same 2×2 panels as sample_validation_1.
+        """
         device = next(self.model.parameters()).device
+        self.model.eval()
 
         # ------------------- save a checkpoint -------------------
         model_dir = self.results_folder / 'model_weights'
@@ -248,74 +264,48 @@ class Trainer(object):
             'optimizer_state_dict': self.opt.state_dict()
         }, str(ckpt_path))
 
-        # ------------------- sampling from the model -------------------
-        B_gen  = getattr(self, 'val_batch_size', self.train_batch_size)
-        D_feat = getattr(self, 'd_feat', 4)
-        samples = self.model.sample(B=B_gen, D=D_feat, eps_model=None, adj=self.base_adj)  # [B,N,D] float64
-        print("Generated samples obtained.")
-
-        # ------------------- sizes / community ordering -------------------
-        if hasattr(self, 'ds') and hasattr(self.ds, 'cfg'):
-            cfg   = self.ds.cfg
-            sizes = tuple(cfg.sizes)
+        # ------------------- collect CLEAN x0 from dataset -------------------
+        # Prefer fixed validation indices if present; else take first val_batch_size items.
+        if hasattr(self, 'val_indices') and len(getattr(self, 'val_indices', [])) > 0:
+            idx_list = self.val_indices.tolist()
         else:
-            N = samples.shape[1]
+            B_gen = getattr(self, 'val_batch_size', self.train_batch_size)
+            idx_list = list(range(min(B_gen, len(self.ds))))
+
+        clean_X_list = []
+        for i in idx_list:
+            item = self.ds[i]
+            X = item["X"] if isinstance(item, dict) else item
+            if isinstance(X, np.ndarray):
+                X = torch.tensor(X)
+            elif not isinstance(X, torch.Tensor):
+                X = torch.as_tensor(X)
+            if X.dim() == 2:  # [N,D]
+                X = X.unsqueeze(0)  # -> [1,N,D]
+            clean_X_list.append(X.squeeze(0))
+        X0 = torch.stack(clean_X_list, dim=0).to(device=device, dtype=torch.float64)  # [B,N,D]
+        print("Clean x0 batch collected from dataset.")
+
+        # Sizes / community ordering (dataset guarantees [C0... , C1...])
+        if hasattr(self, 'ds') and hasattr(self.ds, 'cfg'):
+            n0, n1 = tuple(self.ds.cfg.sizes)
+        else:
+            N = X0.shape[1]
             n0 = getattr(self, 'community_A_size', N // 2)
             n1 = getattr(self, 'community_B_size', N - n0)
-            sizes = (n0, n1)
-
-        n0, n1 = sizes
         N = n0 + n1
-        mask0 = torch.zeros(N, dtype=torch.bool, device=samples.device); mask0[:n0] = True
+        mask0 = torch.zeros(N, dtype=torch.bool, device=X0.device); mask0[:n0] = True
         mask1 = ~mask0
 
-        # ------------------- collect CLEAN x0 from the dataset -------------------
-        use_empirical_ref = hasattr(self, 'ds') and (self.ds is not None)
-        if use_empirical_ref:
-            clean_X_list = []
-            for i in range(B_gen):
-                item = self.ds[i % len(self.ds)]
-                clean_X_list.append(item["X"])  # [N,D]
-            X_clean = torch.stack(clean_X_list, dim=0).to(torch.float64)  # [B,N,D]
-            print("Clean x0 batch collected from dataset.")
-        else:
-            X_clean = None
-            print("WARNING: dataset not found on Trainer; will fallback to parametric reference for plots only.")
+        # ------------------- forward to k_start -------------------
+        k_start = int(min(getattr(self, 'train_max_t', self.model.cfg.T), self.model.cfg.T))
+        k_vec   = torch.full((X0.shape[0],), k_start, device=device, dtype=torch.long)
+        Xk, _, _ = self.model.q_sample(X0, k=k_vec)      # [B,N,D] noisy at k_start
+        X = Xk.clone()                                    # current state to be reversed
 
-        # ------------------- flatten per-community: generated vs clean -------------------
-        x0_gen = samples[:, mask0, :].reshape(-1).to(torch.float64)
-        x1_gen = samples[:, mask1, :].reshape(-1).to(torch.float64)
-
-        if use_empirical_ref:
-            x0_ref = X_clean[:, mask0, :].reshape(-1).to(torch.float64)
-            x1_ref = X_clean[:, mask1, :].reshape(-1).to(torch.float64)
-        else:
-            # parametric fallback (won't be used in your runs)
-            if hasattr(self, 'ds') and hasattr(self.ds, 'cfg'):
-                c0_mean, c0_std = float(self.ds.cfg.comm0.mean), float(self.ds.cfg.comm0.std)
-                c1_mean, c1_std = float(self.ds.cfg.comm1.mean), float(self.ds.cfg.comm1.std)
-            else:
-                c0 = getattr(self, 'community_A_dsitribution', [-3.0, 0.25])
-                c1 = getattr(self, 'community_B_dsitribution', [ 3.5, 0.30])
-                c0_mean, c0_std = float(c0[0]), float(c0[1])
-                c1_mean, c1_std = float(c1[0]), float(c1[1])
-            M0, M1 = x0_gen.numel(), x1_gen.numel()
-            x0_ref = torch.randn(M0, dtype=torch.float64, device=device) * c0_std + c0_mean
-            x1_ref = torch.randn(M1, dtype=torch.float64, device=device) * c1_std + c1_mean
-
-        # ------------------- diagnostics: moments & distances -------------------
-        def summarize(x, label):
-            mu  = x.mean().item()
-            var = x.var(unbiased=True).item()
-            print(f"[DistCheck@epoch {epoch}] {label}: mean={mu:.4f}, var={var:.4f}")
-            return mu, var
-
-        print("Generated (C0/C1) summary:"); summarize(x0_gen, "GEN C0"); summarize(x1_gen, "GEN C1")
-        print("Reference (C0/C1) summary from CLEAN x0:"); summarize(x0_ref, "REF C0"); summarize(x1_ref, "REF C1")
-
+        # ------------------- helper metrics/plotting -------------------
         def ks_w1(a, b):
-            a_sorted, _ = torch.sort(a)
-            b_sorted, _ = torch.sort(b)
+            a_sorted, _ = torch.sort(a); b_sorted, _ = torch.sort(b)
             grid = torch.cat([a_sorted, b_sorted]).sort().values
             def ecdf(sample, grid_vals):
                 idx = torch.searchsorted(sample, grid_vals, right=True)
@@ -325,69 +315,125 @@ class Trainer(object):
             w1 = torch.mean(torch.abs(a_sorted[:n] - b_sorted[:n])).item()
             return ks, w1
 
-        ks0, w10 = ks_w1(x0_gen, x0_ref)
-        ks1, w11 = ks_w1(x1_gen, x1_ref)
-        print(f"[DistCheck@epoch {epoch}] C0 (GEN vs CLEAN): KS={ks0:.4f}, W1={w10:.4f}")
-        print(f"[DistCheck@epoch {epoch}] C1 (GEN vs CLEAN): KS={ks1:.4f}, W1={w11:.4f}")
-
-        # ------------------- visualization that stays visible -------------------
         import matplotlib.pyplot as plt
-        import numpy as np
 
-        out_path = self.results_folder / f'dist_check_epoch{epoch}.png'
-
-        # Helper: robust limits around CLEAN x0 (so clean is always visible)
         def robust_limits(x_clean, lo=0.5, hi=99.5, pad=0.15):
             x_np = x_clean.detach().cpu().numpy()
             a, b = np.percentile(x_np, [lo, hi])
-            # widen by a small padding
             m = b - a + 1e-9
-            return a - pad * m, b + pad * m
+            return a - pad*m, b + pad*m
 
-        # Helper: standardize by clean stats so shapes are comparable
         def zscore(x, ref):
             mu = ref.mean()
             sd = ref.std(unbiased=True) + 1e-12
             return (x - mu) / sd
 
-        # Build figure: 2 rows (C0, C1) x 2 cols (ZOOM on clean range, Z-SCORE view)
-        fig, axes = plt.subplots(2, 2, figsize=(11, 6), constrained_layout=True)
+        def make_panels_and_save(x_clean0, x_clean1, x_curr0, x_curr1, step, out_path):
+            # metrics against CLEAN
+            ks0, w10 = ks_w1(x_curr0, x_clean0)
+            ks1, w11 = ks_w1(x_curr1, x_clean1)
 
-        # ---- Community 0 ----
-        ax = axes[0, 0]
-        lo0, hi0 = robust_limits(x0_ref)
-        ax.hist(x0_ref.detach().cpu().numpy(), bins=120, range=(lo0, hi0), density=True, alpha=0.55, label='CLEAN C0')
-        ax.hist(x0_gen.detach().cpu().numpy(), bins=120, range=(lo0, hi0), density=True, alpha=0.55, label='GEN C0')
-        ax.set_title(f"C0 (ZOOM) | KS={ks0:.3f}, W1={w10:.3f}"); ax.set_xlabel("value"); ax.set_ylabel("density")
-        ax.legend()
+            fig, axes = plt.subplots(2, 2, figsize=(11, 6), constrained_layout=True)
 
-        ax = axes[0, 1]
-        x0_ref_z = zscore(x0_ref, x0_ref); x0_gen_z = zscore(x0_gen, x0_ref)
-        lo0z, hi0z = robust_limits(x0_ref_z, lo=0.5, hi=99.5, pad=0.15)
-        ax.hist(x0_ref_z.detach().cpu().numpy(), bins=120, range=(lo0z, hi0z), density=True, alpha=0.55, label='CLEAN C0 (z)')
-        ax.hist(x0_gen_z.detach().cpu().numpy(), bins=120, range=(lo0z, hi0z), density=True, alpha=0.55, label='GEN C0 (z)')
-        ax.set_title("C0 (standardized by CLEAN)"); ax.set_xlabel("z-score"); ax.set_ylabel("density"); ax.legend()
+            # C0 — ZOOM
+            ax = axes[0, 0]
+            lo0, hi0 = robust_limits(x_clean0)
+            ax.hist(x_clean0.cpu().numpy(), bins=120, range=(lo0, hi0), density=True, alpha=0.55, label='CLEAN C0')
+            ax.hist(x_curr0 .cpu().numpy(), bins=120, range=(lo0, hi0), density=True, alpha=0.55, label='GEN C0')
+            ax.set_title(f"C0 (ZOOM) | KS={ks0:.3f}, W1={w10:.3f}"); ax.set_xlabel("value"); ax.set_ylabel("density")
+            ax.legend()
 
-        # ---- Community 1 ----
-        ax = axes[1, 0]
-        lo1, hi1 = robust_limits(x1_ref)
-        ax.hist(x1_ref.detach().cpu().numpy(), bins=120, range=(lo1, hi1), density=True, alpha=0.55, label='CLEAN C1')
-        ax.hist(x1_gen.detach().cpu().numpy(), bins=120, range=(lo1, hi1), density=True, alpha=0.55, label='GEN C1')
-        ax.set_title(f"C1 (ZOOM) | KS={ks1:.3f}, W1={w11:.3f}"); ax.set_xlabel("value"); ax.set_ylabel("density")
-        ax.legend()
+            # C0 — standardized by CLEAN
+            ax = axes[0, 1]
+            x0_ref_z = zscore(x_clean0, x_clean0); x0_gen_z = zscore(x_curr0, x_clean0)
+            lo0z, hi0z = robust_limits(x0_ref_z)
+            ax.hist(x0_ref_z.cpu().numpy(), bins=120, range=(lo0z, hi0z), density=True, alpha=0.55, label='CLEAN C0 (z)')
+            ax.hist(x0_gen_z.cpu().numpy(), bins=120, range=(lo0z, hi0z), density=True, alpha=0.55, label='GEN C0 (z)')
+            ax.set_title("C0 (standardized by CLEAN)"); ax.set_xlabel("z-score"); ax.set_ylabel("density"); ax.legend()
 
-        ax = axes[1, 1]
-        x1_ref_z = zscore(x1_ref, x1_ref); x1_gen_z = zscore(x1_gen, x1_ref)
-        lo1z, hi1z = robust_limits(x1_ref_z, lo=0.5, hi=99.5, pad=0.15)
-        ax.hist(x1_ref_z.detach().cpu().numpy(), bins=120, range=(lo1z, hi1z), density=True, alpha=0.55, label='CLEAN C1 (z)')
-        ax.hist(x1_gen_z.detach().cpu().numpy(), bins=120, range=(lo1z, hi1z), density=True, alpha=0.55, label='GEN C1 (z)')
-        ax.set_title("C1 (standardized by CLEAN)"); ax.set_xlabel("z-score"); ax.set_ylabel("density"); ax.legend()
+            # C1 — ZOOM
+            ax = axes[1, 0]
+            lo1, hi1 = robust_limits(x_clean1)
+            ax.hist(x_clean1.cpu().numpy(), bins=120, range=(lo1, hi1), density=True, alpha=0.55, label='CLEAN C1')
+            ax.hist(x_curr1 .cpu().numpy(), bins=120, range=(lo1, hi1), density=True, alpha=0.55, label='GEN C1')
+            ax.set_title(f"C1 (ZOOM) | KS={ks1:.3f}, W1={w11:.3f}"); ax.set_xlabel("value"); ax.set_ylabel("density")
+            ax.legend()
 
-        fig.suptitle(f"Distribution check vs CLEAN x0 (epoch {epoch})", y=1.05, fontsize=14)
-        plt.savefig(out_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
+            # C1 — standardized by CLEAN
+            ax = axes[1, 1]
+            x1_ref_z = zscore(x_clean1, x_clean1); x1_gen_z = zscore(x_curr1, x_clean1)
+            lo1z, hi1z = robust_limits(x1_ref_z)
+            ax.hist(x1_ref_z.cpu().numpy(), bins=120, range=(lo1z, hi1z), density=True, alpha=0.55, label='CLEAN C1 (z)')
+            ax.hist(x1_gen_z.cpu().numpy(), bins=120, range=(lo1z, hi1z), density=True, alpha=0.55, label='GEN C1 (z)')
+            ax.set_title("C1 (standardized by CLEAN)"); ax.set_xlabel("z-score"); ax.set_ylabel("density"); ax.legend()
 
-        print(f"[DistCheck@epoch {epoch}] Plot saved to {out_path}")
+            fig.suptitle(f"Distribution check vs CLEAN x0 (epoch {epoch}, t={step})", y=1.05, fontsize=14)
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[DistCheck@epoch {epoch}] Plot saved to {out_path}")
+
+        # Helper to slice/flatten per community
+        def split_flat(Xbatch):
+            x0 = Xbatch[:, mask0, :].reshape(-1).to(torch.float64)
+            x1 = Xbatch[:, mask1, :].reshape(-1).to(torch.float64)
+            return x0, x1
+
+        # First snapshot at t = k_start (noisy vs clean)
+        x0_clean, x1_clean = split_flat(X0)
+        x0_curr , x1_curr  = split_flat(X)
+        make_panels_and_save(
+            x_clean0=x0_clean, x_clean1=x1_clean,
+            x_curr0=x0_curr , x_curr1=x1_curr,
+            step=k_start,
+            out_path=self.results_folder / f'dist_check_epoch{epoch}_t{k_start}.png'
+        )
+
+        # ------------------- reverse: k_start → 0, log every 5 steps -------------------
+        selected_steps = set(range(k_start-5, -1, -5)) | {0}
+        for step in range(k_start, 0, -1):
+            k_vec_step = torch.full((X.shape[0],), step, device=device, dtype=torch.long)
+            add_noise = not (step == 1)
+            X = self.model.p_sample(X, k=k_vec_step, eps_model=None, adj=self.base_adj, add_noise=add_noise)
+
+            if (step-1) in selected_steps:
+                x0_curr, x1_curr = split_flat(X)
+                make_panels_and_save(
+                    x_clean0=x0_clean, x_clean1=x1_clean,
+                    x_curr0=x0_curr , x_curr1=x1_curr,
+                    step=step-1,
+                    out_path=self.results_folder / f'dist_check_epoch{epoch}_t{step-1}.png'
+                )
+
+        
+        
+        # ------------------- make a GIF from saved panels -------------------
+        try:
+            from pathlib import Path
+
+            # Find all panels for this epoch, e.g. dist_check_epoch10_t050.png ... t000.png
+            png_paths = sorted(
+                Path(self.results_folder).glob(f"dist_check_epoch{epoch}_t*.png"),
+                key=lambda p: int(p.stem.split("_t")[-1])  # numeric sort by the t value
+            )
+
+            if png_paths:
+                # Reverse order so animation runs from high t -> low t
+                png_paths = list(reversed(png_paths))
+                frames = [imageio.imread(str(p)) for p in png_paths]
+                gif_path = Path(self.results_folder) / f"dist_check_epoch{epoch}.gif"
+
+                # duration: seconds per frame; tweak to taste
+                imageio.mimsave(gif_path, frames, duration=2.5, loop=0)
+                print(f"[DistCheck@epoch {epoch}] GIF saved to {gif_path}")
+            else:
+                print(f"[DistCheck@epoch {epoch}] No PNGs found to build a GIF.")
+
+        except Exception as e:
+            print(f"[DistCheck@epoch {epoch}] Failed to make GIF: {e}")
+
+        
+
+        self.model.train()
 
 
 

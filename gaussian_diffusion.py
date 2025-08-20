@@ -46,6 +46,7 @@ class GraphDDPMSchedule:
     c: float = 1.0
     sigma: float = 1.0
     gamma: float = 1e-3
+    train_max_t: int = 50
     use_steady_state_init: bool = True  # x_T ~ N(0, sigma^2 L_gamma^{-1}) via Cholesky
 
 
@@ -196,7 +197,7 @@ class GraphGaussianDDPM(nn.Module):
         Bsz = x0.shape[0]
         device = x0.device
         if k is None:
-            k = torch.randint(low=1, high=self.cfg.T + 1, size=(Bsz,), device=device)
+            k = torch.randint(low=1, high=self.cfg.train_max_t + 1, size=(Bsz,), device=device)
 
         with torch.no_grad():
             xk, _, e_k = self.q_sample(x0, k=k)         # [B,N,D]
@@ -240,25 +241,73 @@ class GraphGaussianDDPM(nn.Module):
 
     # ------------------------- Sampling loop -------------------------
     @torch.no_grad()
-    def sample(self, B: int, D: int, eps_model: Optional[nn.Module], adj: torch.Tensor, deterministic_last: bool=True) -> torch.Tensor:
-        device = self.L_gamma.device
-        # Init x_T
-        if self.cfg.use_steady_state_init:
-            # x_T ~ N(0, sigma^2 L_gamma^{-1}) via chol(L_gamma)=U (upper): x = sigma * U^{-1} z
-            z = torch.randn(B, self.N, D, device=device, dtype=self.L_gamma.dtype)
-            U = self.U_chol_upper
-            z2 = z.permute(0,2,1).reshape(B*D, self.N, 1)
-            U_batch = U.unsqueeze(0).expand(B*D, -1, -1)
-            y2 = torch.linalg.solve_triangular(U_batch, z2, upper=True)   # U y = z
-            x = self.cfg.sigma * y2.reshape(B, D, self.N).permute(0,2,1)
-        else:
-            x = torch.randn(B, self.N, D, device=device, dtype=self.L_gamma.dtype)
+    def sample(self, B: int, D: int, eps_model: Optional[nn.Module], adj: torch.Tensor, deterministic_last: bool=True, start_k: Optional[int] = None, x_start: Optional[torch.Tensor] = None,capture_steps: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+        # device = self.L_gamma.device
+        # # Init x_T
+        # if self.cfg.use_steady_state_init:
+        #     # x_T ~ N(0, sigma^2 L_gamma^{-1}) via chol(L_gamma)=U (upper): x = sigma * U^{-1} z
+        #     z = torch.randn(B, self.N, D, device=device, dtype=self.L_gamma.dtype)
+        #     U = self.U_chol_upper
+        #     z2 = z.permute(0,2,1).reshape(B*D, self.N, 1)
+        #     U_batch = U.unsqueeze(0).expand(B*D, -1, -1)
+        #     y2 = torch.linalg.solve_triangular(U_batch, z2, upper=True)   # U y = z
+        #     x = self.cfg.sigma * y2.reshape(B, D, self.N).permute(0,2,1)
+        # else:
+        #     x = torch.randn(B, self.N, D, device=device, dtype=self.L_gamma.dtype)
 
+        # eps_model = self.denoise_fn if eps_model is None else eps_model
+
+        # # Reverse steps
+        # for step in reversed(range(1, self.cfg.train_max_t + 1)):
+        #     k = torch.full((B,), step, device=device, dtype=torch.long)
+        #     add_noise = not (deterministic_last and step == 1)
+        #     x = self.p_sample(x, k=k, eps_model=eps_model, adj=adj, add_noise=add_noise)
+        # return x
+
+
+        device = self.L_gamma.device
+        dtype = self.L_gamma.dtype
         eps_model = self.denoise_fn if eps_model is None else eps_model
 
-        # Reverse steps
-        for step in reversed(range(1, self.cfg.T + 1)):
-            k = torch.full((B,), step, device=device, dtype=torch.long)
+        # Determine start step
+        k_start = int(self.cfg.train_max_t if start_k is None else start_k)
+        assert k_start >= 1, "start_k must be >= 1"
+
+        # Initialize x_k
+        if x_start is not None:
+            # Warm start: use given noisy batch (validation path)
+            x = x_start.to(device=device, dtype=dtype)
+            assert x.dim() == 3 and x.shape[1] == self.N, "x_start must be [B,N,D]"
+            B_eff, _, D_eff = x.shape
+        else:
+            # Cold start: draw x_{k_start} from stationary prior (approx) if enabled
+            assert B is not None and D is not None, "B and D are required when x_start is None"
+            B_eff, D_eff = int(B), int(D)
+            if self.cfg.use_steady_state_init:
+                # x ~ N(0, sigma^2 L_gamma^{-1}); via chol(L_gamma)=U (upper), x = sigma * U^{-1} z
+                z = torch.randn(B_eff, self.N, D_eff, device=device, dtype=dtype)
+                U = self.U_chol_upper
+                z2 = z.permute(0, 2, 1).reshape(B_eff * D_eff, self.N, 1)
+                U_batch = U.unsqueeze(0).expand(B_eff * D_eff, -1, -1)
+                y2 = torch.linalg.solve_triangular(U_batch, z2, upper=True)  # U y = z
+                x = self.cfg.sigma * y2.reshape(B_eff, D_eff, self.N).permute(0, 2, 1)
+            else:
+                x = torch.randn(B_eff, self.N, D_eff, device=device, dtype=dtype)
+
+        # Optional trajectory capture (post-step states labeled by the step k we just executed)
+        snapshots = {}
+        capture_set = set(capture_steps) if capture_steps is not None else None
+
+        # Reverse loop: k_start → 1
+        for step in range(k_start, 0, -1):
+            k_vec = torch.full((B_eff,), step, device=device, dtype=torch.long)
             add_noise = not (deterministic_last and step == 1)
-            x = self.p_sample(x, k=k, eps_model=eps_model, adj=adj, add_noise=add_noise)
+            x = self.p_sample(x, k=k_vec, eps_model=eps_model, adj=adj, add_noise=add_noise)
+
+            if capture_set is not None and step in capture_set:
+                # Store a CPU copy to avoid accidental inplace issues downstream
+                snapshots[int(step)] = x.detach().cpu().clone()
+
+        if capture_set is not None:
+            return x, snapshots
         return x
