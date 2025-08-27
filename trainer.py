@@ -9,8 +9,6 @@ from functools import partial
 import numpy as np
 import imageio.v2 as imageio
 
-
-
 from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
@@ -41,6 +39,38 @@ def loss_backwards(fp16, loss, optimizer, **kwargs):
     else:
         loss.backward(**kwargs)
 
+
+
+# ------------------------------------------------------------------------------------------
+# Laplacians
+# ------------------------------------------------------------------------------------------
+def laplacian_matrix(A: torch.Tensor, kind: str = "unnormalized") -> torch.Tensor:
+    """
+    Build a graph Laplacian from adjacency A.
+
+    kind:
+      - "unnormalized": L = D - A
+      - "sym":          L_sym = I - D^{-1/2} A D^{-1/2}   (symmetric normalized)
+
+    Notes:
+      - Handles isolated nodes safely (deg==0 => inv sqrt set to 0).
+      - Preserves dtype/device of A.
+    """
+    A = A.to(dtype=torch.get_default_dtype())
+    N = A.shape[0]
+    deg = A.sum(dim=1)
+    if kind == "unnormalized":
+        D = torch.diag(deg)
+        return D - A
+    elif kind == "sym":
+        inv_sqrt_deg = torch.where(deg > 0, deg.rsqrt(), torch.zeros_like(deg))
+        Dm12 = torch.diag(inv_sqrt_deg)
+        I = torch.eye(N, device=A.device, dtype=A.dtype)
+        return I - Dm12 @ A @ Dm12
+    else:
+        raise ValueError(f"Unknown laplacian kind: {kind!r}. Use 'unnormalized' or 'sym'.")
+
+
 # ============================================================================================
 # ============================================================================================
 
@@ -53,8 +83,8 @@ class Trainer(object):
         data_points: int = 1000,
         community_A_size: int = 5,
         community_B_size: int = 5,
-        p_intra: int = 0.85,
-        p_inter: int = 0.20,
+        p_intra: float = 0.85,
+        p_inter: float = 0.20,
         community_A_dsitribution = [-3.0, 0.25],
         community_B_dsitribution = [3.5, 0.30],
         random_seed: int = 42,
@@ -72,10 +102,20 @@ class Trainer(object):
         print_validation: int = 10,
         results_folder: str = './results',
         val_batch_size: int = 1,
+        # --- diffusion schedule / reverse options (NEW; wired from main.py) ---
+        warp: str = "loglinear",             # 'uniform' | 'cosine' | 'poly' | 'loglinear'
+        tau_T: float = 5.0,
+        poly_p: float = 1.0,
+        log_eps: float = 1e-6,
+        dt: float = None,             # used only if warp=='uniform'
+        mean_type: str = "posterior_eps",    # 'score' | 'posterior_eps'
         use_steady_state_init: bool = True,
-        dt: float or bool = None,
+        deterministic_last: bool = True,
+        start_k: int = None,
+        laplacian: str = "unnormalized",
+        train_ckpt_path: str = "",
+        resume_training: bool = False
     ):
-
         super().__init__()
 
         # Choose device from eps_network if placed already, otherwise default CUDA if available
@@ -91,18 +131,36 @@ class Trainer(object):
         N = adj0.shape[0]
 
         adj_t = torch.tensor(adj0, dtype=dtype, device=device)
-        D = torch.diag(adj_t.sum(dim=1))
-        L = (D - adj_t)
+        L = laplacian_matrix(adj_t, kind=laplacian)
 
         self.base_adj = adj_t
         self.train_max_t = train_max_t
+        self.deterministic_last = bool(deterministic_last)
+        self.start_k_override = start_k  # may be None
 
-        dt = 1.0/timesteps if dt is None else dt
+        # --- schedule config: respect warp; only use dt when warp='uniform'
+        if warp.lower() == "uniform":
+            eff_dt = (1.0 / timesteps) if dt is None else float(dt)
+        else:
+            eff_dt = None  # ignored by GraphDDPMSchedule for non-uniform warps
 
-        cfg = GraphDDPMSchedule(T=timesteps, dt=dt, c=c, sigma=sigma, gamma=gamma, train_max_t=train_max_t, use_steady_state_init=True)
+        cfg = GraphDDPMSchedule(
+            T=timesteps,
+            c=c,
+            sigma=sigma,
+            gamma=gamma,
+            train_max_t=train_max_t,
+            use_steady_state_init=use_steady_state_init,
+            warp=warp,
+            tau_T=tau_T,
+            poly_p=poly_p,
+            log_eps=log_eps,
+            dt=eff_dt,
+            mean_type=mean_type
+        )
+
         # Build diffusion (new API)
         self.model = GraphGaussianDDPM(L, eps_network, cfg)
-
 
         # misc training settings
         self.print_loss_every = print_loss_every
@@ -121,18 +179,20 @@ class Trainer(object):
         # dataset + loader
         comm0 = CommunitySpec(mean=community_A_dsitribution[0], std=community_A_dsitribution[1])
         comm1 = CommunitySpec(mean=community_B_dsitribution[0], std=community_B_dsitribution[1])
-        self.ds = SBMSyntheticDataset(M = data_points,
-                                        d_feat = d_feat,
-                                        sizes = (community_A_size, community_B_size),
-                                        p_intra = p_intra,
-                                        p_inter = p_inter,
-                                        seed = random_seed,
-                                        comm0 = comm0,
-                                        comm1 = comm1,
-                                        return_pyg=False,
-                                        include_edge_index=False,
-                                        dtype=torch.float32,
-                                        topology_seed=random_seed)
+        self.ds = SBMSyntheticDataset(
+            M=data_points,
+            d_feat=d_feat,
+            sizes=(community_A_size, community_B_size),
+            p_intra=p_intra,
+            p_inter=p_inter,
+            seed=random_seed,
+            comm0=comm0,
+            comm1=comm1,
+            return_pyg=False,
+            include_edge_index=False,
+            dtype=torch.float32,
+            topology_seed=random_seed
+        )
 
         self.dl = data.DataLoader(self.ds, batch_size=self.train_batch_size, shuffle=True, pin_memory=True)
 
@@ -153,6 +213,11 @@ class Trainer(object):
         g = torch.Generator().manual_seed(self.seed)   # reproducible
         self.val_indices = torch.randperm(len(self.ds), generator=g)[:B]
 
+        self.start_epoch = 1
+        if train_ckpt_path:
+            self._load_training_or_pretrained_checkpoint(train_ckpt_path, resume_training)
+
+
 
     # -------------------- utilities --------------------
     @staticmethod
@@ -171,12 +236,47 @@ class Trainer(object):
         # fallback
         return torch.as_tensor(features, dtype=torch.float32, device=device)
 
+    def _load_training_or_pretrained_checkpoint(self, path: str, resume: bool):
+        device = next(self.model.parameters()).device
+        print(f"[Trainer] Loading checkpoint: {path}")
+        sd = torch.load(path, map_location=device)
+
+        # case A: full training checkpoint saved by our Trainer (_sample_validation)
+        if isinstance(sd, dict) and "model_state_dict" in sd:
+            self.model.load_state_dict(sd["model_state_dict"], strict=False)
+            print("[Trainer] Loaded model_state_dict into GraphGaussianDDPM (strict=False).")
+            if resume:
+                if "optimizer_state_dict" in sd:
+                    try:
+                        self.opt.load_state_dict(sd["optimizer_state_dict"])
+                        print("[Trainer] Restored optimizer state.")
+                    except Exception as e:
+                        print(f"[Trainer] WARNING: could not load optimizer state: {e}")
+                ep = int(sd.get("epoch", 0))
+                self.start_epoch = max(1, ep + 1)
+                print(f"[Trainer] Resuming training from epoch {self.start_epoch}.")
+            else:
+                print("[Trainer] Warm-started model weights (not resuming optimizer/epoch).")
+            return
+
+        # case B: raw state_dict for the ε-network only (GraphEpsDenoiser)
+        try:
+            self.model.eps_network.load_state_dict(sd, strict=False)
+            print("[Trainer] Loaded raw state_dict into eps_network (strict=False).")
+        except Exception as e:
+            print(f"[Trainer] WARNING: Could not load as eps_network state_dict: {e}")
+            try:
+                self.model.load_state_dict(sd, strict=False)
+                print("[Trainer] Fallback: loaded raw state_dict into full diffusion model (strict=False).")
+            except Exception as ee:
+                print(f"[Trainer] ERROR: Could not load checkpoint in any known format: {ee}")
+
     # -------------------- training --------------------
     def train(self):
         backwards = partial(loss_backwards, self.fp16)
         device = next(self.model.parameters()).device
 
-        for epoch in range(1, self.num_epochs + 1):
+        for epoch in range(self.start_epoch, self.num_epochs + 1):
             self.model.train()
             running_loss = 0.0
             epoch_loss_sum = 0.0
@@ -186,7 +286,8 @@ class Trainer(object):
                 features = batch["X"]
                 
                 z = self._as_features_tensor(features, device).to(torch.float32)
-                adj_batch = self.base_adj
+                # adj_batch = self.base_adj
+                adj_batch = self.model.L_gamma
 
                 z = z.float().to(torch.float64)
                 adj_batch = adj_batch.float().to(torch.float64)
@@ -207,10 +308,6 @@ class Trainer(object):
                     self.opt.step()
                     self.opt.zero_grad()
 
-                # if i % self.print_loss_every == 0:
-                #     print(f'Epoch {epoch}, Batch {i}, Loss {running_loss/self.print_loss_every:.4f}')
-                #     running_loss = 0.0
-
             # average loss for the epoch
             avg_loss = epoch_loss_sum / epoch_batch_count if epoch_batch_count > 0 else 0.0
             self.epoch_losses.append(avg_loss)
@@ -218,7 +315,6 @@ class Trainer(object):
             if epoch % self.print_loss_every == 0:
                 print(f'Epoch {epoch}, Loss {avg_loss:.4f}')
             
-
             # save loss plot
             self._save_loss_plot()
 
@@ -244,12 +340,15 @@ class Trainer(object):
         plt.close()
 
 
+
+
+
     @torch.no_grad()
     def _sample_validation(self, epoch: int):
         """
-        Forward clean data to k = self.train_max_t, then run the reverse process
-        back to 0. At a few steps, compare the current (denoised) distribution
-        against the CLEAN x0 using the same 2×2 panels as sample_validation_1.
+        1) Forward CLEAN -> k_start, then reverse to 0 with panels + GIF.
+        2) NEW: Sample x ~ N(0, σ^2 L_gamma^{-1}) at k_start, then reverse to 0
+        with panels vs CLEAN + GIF.
         """
         device = next(self.model.parameters()).device
         self.model.eval()
@@ -265,7 +364,6 @@ class Trainer(object):
         }, str(ckpt_path))
 
         # ------------------- collect CLEAN x0 from dataset -------------------
-        # Prefer fixed validation indices if present; else take first val_batch_size items.
         if hasattr(self, 'val_indices') and len(getattr(self, 'val_indices', [])) > 0:
             idx_list = self.val_indices.tolist()
         else:
@@ -290,15 +388,16 @@ class Trainer(object):
         if hasattr(self, 'ds') and hasattr(self.ds, 'cfg'):
             n0, n1 = tuple(self.ds.cfg.sizes)
         else:
-            N = X0.shape[1]
-            n0 = getattr(self, 'community_A_size', N // 2)
-            n1 = getattr(self, 'community_B_size', N - n0)
+            N_tmp = X0.shape[1]
+            n0 = getattr(self, 'community_A_size', N_tmp // 2)
+            n1 = getattr(self, 'community_B_size', N_tmp - n0)
         N = n0 + n1
         mask0 = torch.zeros(N, dtype=torch.bool, device=X0.device); mask0[:n0] = True
         mask1 = ~mask0
 
         # ------------------- forward to k_start -------------------
-        k_start = int(min(getattr(self, 'train_max_t', self.model.cfg.T), self.model.cfg.T))
+        k_start = self.start_k_override if self.start_k_override is not None else self.train_max_t
+        k_start = int(min(max(1, k_start), self.model.cfg.T))
         k_vec   = torch.full((X0.shape[0],), k_start, device=device, dtype=torch.long)
         Xk, _, _ = self.model.q_sample(X0, k=k_vec)      # [B,N,D] noisy at k_start
         X = Xk.clone()                                    # current state to be reversed
@@ -378,7 +477,7 @@ class Trainer(object):
             x1 = Xbatch[:, mask1, :].reshape(-1).to(torch.float64)
             return x0, x1
 
-        # First snapshot at t = k_start (noisy vs clean)
+        # ---------- (A) Reverse from FORWARD-noised x_k (existing behavior) ----------
         x0_clean, x1_clean = split_flat(X0)
         x0_curr , x1_curr  = split_flat(X)
         make_panels_and_save(
@@ -388,14 +487,16 @@ class Trainer(object):
             out_path=self.results_folder / f'dist_check_epoch{epoch}_t{k_start}.png'
         )
 
-        # ------------------- reverse: k_start → 0, log every 5 steps -------------------
         selected_steps = set(range(k_start-5, -1, -5)) | {0}
         for step in range(k_start, 0, -1):
             k_vec_step = torch.full((X.shape[0],), step, device=device, dtype=torch.long)
-            add_noise = not (step == 1)
-            X = self.model.p_sample(X, k=k_vec_step, eps_model=None, adj=self.base_adj, add_noise=add_noise)
+            add_noise = not (self.deterministic_last and step == 1)
+            # X = self.model.p_sample(X, k=k_vec_step, eps_model=None, adj=self.base_adj, add_noise=add_noise)
+            # Passing L_gamma
+            X = self.model.p_sample(X, k=k_vec_step, eps_model=None, adj=self.model.L_gamma, add_noise=add_noise)
 
-            if (step-1) in selected_steps:
+            # if (step-1) in selected_steps:
+            if (step-1) == 0:
                 x0_curr, x1_curr = split_flat(X)
                 make_panels_and_save(
                     x_clean0=x0_clean, x_clean1=x1_clean,
@@ -404,40 +505,82 @@ class Trainer(object):
                     out_path=self.results_folder / f'dist_check_epoch{epoch}_t{step-1}.png'
                 )
 
-        
-        
-        # ------------------- make a GIF from saved panels -------------------
-        try:
-            from pathlib import Path
+        # ---------- GIF (A) ----------
+        # try:
+        #     from pathlib import Path
+        #     png_paths = sorted(
+        #         Path(self.results_folder).glob(f"dist_check_epoch{epoch}_t*.png"),
+        #         key=lambda p: int(p.stem.split("_t")[-1])  # numeric sort by the t value
+        #     )
+        #     if png_paths:
+        #         png_paths = list(reversed(png_paths))  # high t -> low t
+        #         frames = [imageio.imread(str(p)) for p in png_paths]
+        #         gif_path = Path(self.results_folder) / f"dist_check_epoch{epoch}.gif"
+        #         imageio.mimsave(gif_path, frames, duration=2.5, loop=0)
+        #         print(f"[DistCheck@epoch {epoch}] GIF saved to {gif_path}")
+        #     else:
+        #         print(f"[DistCheck@epoch {epoch}] No PNGs found to build a GIF.")
+        # except Exception as e:
+        #     print(f"[DistCheck@epoch {epoch}] Failed to make GIF: {e}")
 
-            # Find all panels for this epoch, e.g. dist_check_epoch10_t050.png ... t000.png
-            png_paths = sorted(
-                Path(self.results_folder).glob(f"dist_check_epoch{epoch}_t*.png"),
-                key=lambda p: int(p.stem.split("_t")[-1])  # numeric sort by the t value
-            )
+        # ---------- (B) NEW: Reverse from STEADY-STATE init x ~ N(0, σ² L_γ^{-1}) ----------
+        # Build steady-state samples using stored Cholesky of L_gamma:  L_gamma = U^T U
+        print(f"[DistCheck@epoch {epoch}] Starting steady-state init reverse...")
+        B_eff, N_eff, D_eff = X0.shape
+        sigma = self.model.cfg.sigma
+        U = self.model.U_chol_upper  # [N,N], upper-triangular
 
-            if png_paths:
-                # Reverse order so animation runs from high t -> low t
-                png_paths = list(reversed(png_paths))
-                frames = [imageio.imread(str(p)) for p in png_paths]
-                gif_path = Path(self.results_folder) / f"dist_check_epoch{epoch}.gif"
+        z = torch.randn(B_eff, N_eff, D_eff, device=device, dtype=torch.float64)  # N(0,I)
+        # Solve U y = z  =>  y = U^{-1} z
+        z2 = z.permute(0, 2, 1).reshape(B_eff * D_eff, N_eff, 1)
+        U_batch = U.unsqueeze(0).expand(B_eff * D_eff, -1, -1)
+        y2 = torch.linalg.solve_triangular(U_batch, z2, upper=True)   # (U y = z)
+        X_ss = sigma * y2.reshape(B_eff, D_eff, N_eff).permute(0, 2, 1).contiguous()  # [B,N,D]
 
-                # duration: seconds per frame; tweak to taste
-                imageio.mimsave(gif_path, frames, duration=2.5, loop=0)
-                print(f"[DistCheck@epoch {epoch}] GIF saved to {gif_path}")
-            else:
-                print(f"[DistCheck@epoch {epoch}] No PNGs found to build a GIF.")
+        # Treat X_ss as x_{k_start}; run reverse to 0, log every 5 steps + 0
+        X = X_ss.clone()
 
-        except Exception as e:
-            print(f"[DistCheck@epoch {epoch}] Failed to make GIF: {e}")
+        # Initial panel at t = k_start (SS-init vs CLEAN)
+        x0_curr, x1_curr = split_flat(X)
+        make_panels_and_save(
+            x_clean0=x0_clean, x_clean1=x1_clean,
+            x_curr0=x0_curr , x_curr1=x1_curr,
+            step=k_start,
+            out_path=self.results_folder / f'dist_checkSS_epoch{epoch}_t{k_start}.png'
+        )
 
-        
+        selected_steps_ss = set(range(k_start-5, -1, -5)) | {0}
+        for step in range(k_start, 0, -1):
+            k_vec_step = torch.full((X.shape[0],), step, device=device, dtype=torch.long)
+            add_noise = not (self.deterministic_last and step == 1)
+            X = self.model.p_sample(X, k=k_vec_step, eps_model=None, adj=self.base_adj, add_noise=add_noise)
+
+            # if (step-1) in selected_steps_ss:
+            if (step-1) == 0:
+                x0_curr, x1_curr = split_flat(X)
+                make_panels_and_save(
+                    x_clean0=x0_clean, x_clean1=x1_clean,
+                    x_curr0=x0_curr , x_curr1=x1_curr,
+                    step=step-1,
+                    out_path=self.results_folder / f'dist_checkSS_epoch{epoch}_t{step-1}.png'
+                )
+
+        # ---------- GIF (B) ----------
+        # try:
+        #     from pathlib import Path
+        #     png_paths_ss = sorted(
+        #         Path(self.results_folder).glob(f"dist_checkSS_epoch{epoch}_t*.png"),
+        #         key=lambda p: int(p.stem.split("_t")[-1])
+        #     )
+        #     if png_paths_ss:
+        #         png_paths_ss = list(reversed(png_paths_ss))  # high t -> low t
+        #         frames_ss = [imageio.imread(str(p)) for p in png_paths_ss]
+        #         gif_path_ss = Path(self.results_folder) / f"dist_checkSS_epoch{epoch}.gif"
+        #         imageio.mimsave(gif_path_ss, frames_ss, duration=2.5, loop=0)
+        #         print(f"[DistCheck@epoch {epoch}] SS-init GIF saved to {gif_path_ss}")
+        #     else:
+        #         print(f"[DistCheck@epoch {epoch}] No SS PNGs found to build a GIF.")
+        # except Exception as e:
+        #     print(f"[DistCheck@epoch {epoch}] Failed to make SS GIF: {e}")
 
         self.model.train()
-
-
-
-
-
-# ============================================================================================
-# ============================================================================================

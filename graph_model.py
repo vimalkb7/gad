@@ -31,15 +31,87 @@ def sinusoidal_timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 def normalize_adj(A: torch.Tensor, add_self_loops: bool = True, eps: float = 1e-9) -> torch.Tensor:
     """
-    Symmetric normalization  A_hat = D^{-1/2} (A + I) D^{-1/2}.
-    Works with dense A. If your graphs are large/sparse, port this to sparse ops.
+    Â = D^{-1/2} (A + I) D^{-1/2} (if add_self_loops True).
     """
     if add_self_loops:
         A = A + torch.eye(A.size(-1), device=A.device, dtype=A.dtype)
-    deg = A.sum(-1)  # [N]
+    deg = A.sum(-1)
     inv_sqrt_deg = (deg + eps).pow(-0.5)
-    D_inv_sqrt = torch.diag(inv_sqrt_deg)
-    return D_inv_sqrt @ A @ D_inv_sqrt
+    Dm12 = torch.diag(inv_sqrt_deg)
+    return Dm12 @ A @ Dm12
+
+
+# ---------- New: Laplacians & operator builder ----------
+
+def laplacian_unnormalized(A: torch.Tensor) -> torch.Tensor:
+    D = torch.diag(A.sum(-1))
+    return D - A
+
+def laplacian_symmetric(A: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """
+    L_sym = I - D^{-1/2} A D^{-1/2}
+    """
+    deg = A.sum(-1)
+    inv_sqrt_deg = (deg + eps).pow(-0.5)
+    Dm12 = torch.diag(inv_sqrt_deg)
+    I = torch.eye(A.size(-1), dtype=A.dtype, device=A.device)
+    return I - Dm12 @ A @ Dm12
+
+def _normalize_operator_name(kind: str) -> str:
+    k = kind.lower()
+    aliases = {
+        "adj": "adjacency",
+        "norm_adj": "normalized_adjacency",
+        "laplacian_sym": "laplacian_sym",
+        "lgamma": "laplacian_gamma",
+        "lgamma_sym": "laplacian_gamma_sym",
+    }
+    return aliases.get(k, k)
+
+def build_graph_operator(
+    A: torch.Tensor,
+    operator_kind: str,
+    *,
+    gamma: float = 0.0,
+    add_self_loops: bool = True,
+    eps: float = 1e-9,
+) -> torch.Tensor:
+    """
+    Returns an [N,N] operator among:
+      'adjacency', 'normalized_adjacency',
+      'laplacian', 'laplacian_sym',
+      'laplacian_gamma', 'laplacian_gamma_sym'
+    """
+    kind = _normalize_operator_name(operator_kind)
+
+    if kind == "adjacency":
+        return A
+
+    if kind == "normalized_adjacency":
+        return normalize_adj(A, add_self_loops=add_self_loops, eps=eps)
+
+    if kind == "laplacian":
+        return laplacian_unnormalized(A)
+
+    if kind == "laplacian_sym":
+        return laplacian_symmetric(A, eps=eps)
+
+    if kind == "laplacian_gamma":
+        L = laplacian_unnormalized(A)
+        N = A.size(-1)
+        return L + float(gamma) * torch.eye(N, dtype=A.dtype, device=A.device)
+
+    if kind == "laplacian_gamma_sym":
+        Ls = laplacian_symmetric(A, eps=eps)
+        N = A.size(-1)
+        return Ls + float(gamma) * torch.eye(N, dtype=A.dtype, device=A.device)
+
+    raise ValueError(
+        f"Unknown operator_kind '{operator_kind}'. "
+        "Use one of: 'adjacency','normalized_adjacency','laplacian',"
+        "'laplacian_sym','laplacian_gamma','laplacian_gamma_sym' "
+        "(aliases: adj, norm_adj, Lgamma, Lgamma_sym)."
+    )
 
 
 # -----------------------
@@ -48,15 +120,14 @@ def normalize_adj(A: torch.Tensor, add_self_loops: bool = True, eps: float = 1e-
 
 class GCNConv(nn.Module):
     """
-    Simple GCN layer: H' = A_hat H W + b
+    Simple GCN layer: H' = M H W  where M is the chosen operator.
     """
     def __init__(self, in_dim: int, out_dim: int, bias: bool = True):
         super().__init__()
         self.lin = nn.Linear(in_dim, out_dim, bias=bias)
 
-    def forward(self, X: torch.Tensor, A_hat: torch.Tensor) -> torch.Tensor:
-        # Supports X as [N,H] or [B,N,H]; (N,N) @ (B,N,H) broadcasts on leading dim
-        return A_hat @ self.lin(X)
+    def forward(self, X: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+        return M @ self.lin(X)
 
 
 class FiLM(nn.Module):
@@ -75,18 +146,14 @@ class FiLM(nn.Module):
         cond: [1, cond_dim], [B, cond_dim], or [N, cond_dim] (broadcast sensibly)
         """
         if cond.dim() == 1:
-            cond = cond.unsqueeze(0)  # [1, cond_dim]
+            cond = cond.unsqueeze(0)
 
-        if x.dim() == 3:
-            B = x.size(0)
-        else:
-            B = 1
-
+        B = x.size(0) if x.dim() == 3 else 1
         if cond.size(0) == 1 and B > 1:
-            cond = cond.expand(B, -1)  # [B, cond_dim]
+            cond = cond.expand(B, -1)   # [B, cond_dim]
 
-        g = self.gamma(cond)  # [B, H] or [1, H]
-        b = self.beta(cond)   # [B, H] or [1, H]
+        g = self.gamma(cond)    # [B, H] or [1, H]
+        b = self.beta(cond)     # [B, H] or [1, H]
 
         if x.dim() == 3:
             g = g.unsqueeze(1)  # [B,1,H] -> broadcast over N
@@ -113,22 +180,20 @@ class ResidualGCNBlock(nn.Module):
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
         self.film2 = FiLM(time_dim, hidden_dim)
 
-    def forward(self, X: torch.Tensor, A_hat: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        # Block 1
+    def forward(self, X: torch.Tensor, M: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         h = self.norm1(X)
-        h = self.conv1(h, A_hat)
+        h = self.conv1(h, M)
         h = self.film1(h, t_emb)
         h = F.gelu(h)
         h = self.dropout(h)
-        X = X + h  # residual
+        X = X + h
 
-        # Block 2
         h = self.norm2(X)
-        h = self.conv2(h, A_hat)
+        h = self.conv2(h, M)
         h = self.film2(h, t_emb)
         h = F.gelu(h)
         h = self.dropout(h)
-        X = X + h  # residual
+        X = X + h
         return X
 
 
@@ -138,21 +203,14 @@ class ResidualGCNBlock(nn.Module):
 
 class GraphEpsDenoiser(nn.Module):
     """
-    Predicts ε_theta(x_t, t, A) from node features and graph structure.
+    ε_θ(x_t, t; A, choice) with user-selectable graph operator.
 
-    Args:
-      in_dim:    input feature dimension (d_in)
-      hidden:    width of hidden node embeddings
-      depth:     number of residual graph blocks
-      time_dim:  dimension of timestep embedding
-      dropout:   dropout rate inside blocks
-      add_self_loops: whether to add self-loops before normalization
-
-    Forward:
-      X: [N, d_in] or [B, N, d_in]
-      A: [N, N]
-      t: scalar int or tensor-like (or [B])
-      returns ε_hat: [N, d_in] or [B, N, d_in] matching X
+    operator_kind ∈ {
+      'adjacency','normalized_adjacency',
+      'laplacian','laplacian_sym',
+      'laplacian_gamma','laplacian_gamma_sym'
+      (aliases: 'adj','norm_adj','Lgamma','Lgamma_sym')
+    }
     """
     def __init__(
         self,
@@ -161,10 +219,17 @@ class GraphEpsDenoiser(nn.Module):
         depth: int = 6,
         time_dim: int = 128,
         dropout: float = 0.0,
-        add_self_loops: bool = True
+        add_self_loops: bool = True,        # only impacts normalized_adjacency
+        *,
+        operator_kind: str = "adjacency",
+        gamma: float = 0.0,
+        eps: float = 1e-9,
     ):
         super().__init__()
         self.add_self_loops = add_self_loops
+        self.operator_kind = operator_kind
+        self.gamma = float(gamma)
+        self.eps = float(eps)
 
         self.in_proj = nn.Linear(in_dim, hidden)
         self.time_dim = time_dim
@@ -187,32 +252,31 @@ class GraphEpsDenoiser(nn.Module):
         model_dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
 
-        # Cast inputs to the model dtype/device
         X = X.to(dtype=model_dtype, device=device)
         A = A.to(dtype=model_dtype, device=device)
 
-        # 1) Normalize adjacency once per forward
-        A_hat = normalize_adj(A, add_self_loops=self.add_self_loops, eps=1e-9)
+        # Build the selected operator
+        M = build_graph_operator(
+            A,
+            operator_kind=self.operator_kind,
+            gamma=self.gamma,
+            add_self_loops=self.add_self_loops,
+            eps=self.eps,
+        )
 
-        # 2) Timestep embedding to [1, time_dim] (FiLM will broadcast over batch/nodes)
+        # Time embedding
         if not torch.is_tensor(t):
             t = torch.tensor(t, device=device)
         else:
             t = t.to(device=device)
         t = t.to(dtype=model_dtype, device=device)
 
-        t_emb = sinusoidal_timestep_embedding(t.flatten(), self.time_dim)  # [B, time_dim] or [1, time_dim]
-        # t_emb = t_emb.mean(dim=0, keepdim=True)                            # [1, time_dim]
-        t_emb = self.t_mlp(t_emb)                                          # [1, time_dim]
+        t_emb = sinusoidal_timestep_embedding(t.flatten(), self.time_dim)
+        t_emb = self.t_mlp(t_emb)
 
-        # 3) Node encoder
+        # Encode -> residual graph blocks -> project to ε
         h = self.in_proj(X)
-
-        # 4) Residual graph blocks with FiLM(t)
         for blk in self.blocks:
-            h = blk(h, A_hat, t_emb)
-
-        # 5) Project back to ε
+            h = blk(h, M, t_emb)
         h = self.out_norm(h)
-        eps_hat = self.out_proj(h)
-        return eps_hat
+        return self.out_proj(h)
