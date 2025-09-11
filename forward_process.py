@@ -730,11 +730,11 @@ if __name__ == "__main__":
     sigma  = 0.01
 
     # Time-warp scheduler
-    warp   = "cosine"   # 'loglinear' | 'cosine' | 'poly' | 'uniform'
+    warp   = "loglinear"   # 'loglinear' | 'cosine' | 'poly' | 'uniform'
     tau_T  = 5.0
     poly_p = 0.5
 
-    out_dir = "/home/nfs/vkumarasamybal/Code/Euler_Maruyama/Forward_Pass/Exp5"
+    out_dir = "/home/nfs/vkumarasamybal/Code/Euler_Maruyama/Forward_Pass/Exp6"
 
     # ------ Run ------
     run_fixed_params_and_plot(
