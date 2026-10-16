@@ -60,6 +60,20 @@ class VESDE:
         std = sigma_t
         return mean, std
 
+    @torch.no_grad()
+    def marginal_sampling(self, x0, t):
+        mean_t, std_t = self.marginal_prob(x0, t)
+        eps = torch.randn_like(x0)
+        return mean_t + self._expand_like(std_t, x0) * eps
+
+    def score(self, x, t, x0_hat):
+        # Score of p(x_t | x_0) evaluated at the denoiser estimate x0_hat
+        t = self._to_tensor_time(t, x)
+        sigma_t = self._sigma(t)                   # (B,)
+        num = x - x0_hat
+        den = self._expand_like(sigma_t**2, x).clamp_min(1e-12)
+        return - num / den
+
     def prior_sampling(self, shape, device=None, dtype=torch.float32):
         dev = device or self.device or "cpu"
         return self.sigma_max * torch.randn(*shape, device=dev, dtype=dtype)
@@ -139,6 +153,21 @@ class VPSDE:
         std = torch.sqrt(1.0 - a_bar)
         return mean, std
 
+    @torch.no_grad()
+    def marginal_sampling(self, x0, t):
+        mean_t, std_t = self.marginal_prob(x0, t)
+        eps = torch.randn_like(x0)
+        return mean_t + self._expand_like(std_t, x0) * eps
+
+    def score(self, x, t, x0_hat):
+        # Score of p(x_t | x_0) evaluated at the denoiser estimate x0_hat
+        if t.dim() == 0:
+            t = t.repeat(x.shape[0])
+        a_bar = self._alpha_bar(t)                 # (B,)
+        num = x - torch.sqrt(a_bar)[:, None] * x0_hat
+        den = (1.0 - a_bar)[:, None].clamp_min(1e-8)
+        return - num / den
+
     def prior_sampling(self, shape, device=None, dtype=torch.float32):
         dev = device or self.device or "cpu"
         return torch.randn(*shape, device=dev, dtype=dtype)
@@ -162,9 +191,15 @@ class VPSDE:
 
 
 class GASDE:
-    def __init__(self, L_gamma: torch.Tensor, S: float = 1.0,
-                 sigma: float = 1.0, T: float = 1.0,
-                 alpha: float = 4.0, c_min: float = 0.1, device=None):
+    def __init__(
+            self,
+            L_gamma: torch.Tensor,
+            S: float = 1.0,
+            sigma: float = 1.0,
+            T: float = 1.0,
+            alpha: float = 2.0,
+            c_min: float = 0.1,
+            device=None):
         self.Lg = L_gamma.to(device)
         self.device = device or L_gamma.device
         self.dtype = L_gamma.dtype
@@ -172,22 +207,23 @@ class GASDE:
         self.sigma = float(sigma)
         self.T = float(T)
         self.S = float(S)
-        self.alpha = float(alpha)      # NEW
-        self.c_min = float(c_min)      # NEW
+        self.alpha = alpha
+        self.c_min = c_min
 
         lam, U = torch.linalg.eigh(self.Lg)
         self.U = U
         self.lam = lam
-
+    
     def _c_of_t(self, t: torch.Tensor):
+        # c(t) = c_min + k * (t/T)^alpha, with ∫_0^T c = S  ⇒  k = (S - c_min*T) * (alpha+1) / T
         u = (t / self.T).clamp(0.0, 1.0)
         k = (self.S - self.c_min * self.T) * (self.alpha + 1.0) / self.T
         return self.c_min + k * (u ** self.alpha)
 
     def _s_of_t(self, t: torch.Tensor):
+        # s(t) = c_min * t + (S - c_min*T) * (t/T)^(alpha+1)
         u = (t / self.T).clamp(0.0, 1.0)
         return self.c_min * t + (self.S - self.c_min * self.T) * (u ** (self.alpha + 1.0))
-
 
     def _expand_like(self, b, x):
         while b.dim() < x.dim():
@@ -209,6 +245,14 @@ class GASDE:
         drift_rev = drift_fwd - self._expand_like(diffusion**2 , x) * score
         return drift_rev, diffusion
 
+    def _var_eig(self, s):
+        # Var of p(x_t | x_0) per mode: sigma^2 (1 - e^{-2 s lam}) / lam, with limit 2 sigma^2 s for lam = 0 (no drift)
+        lam = self.lam[None, :]                                            # (1,N)
+        zero = lam <= 1e-6
+        lam_safe = torch.where(zero, torch.ones_like(lam), lam)
+        var_eig = (self.sigma**2) * (1.0 - torch.exp(-2.0 * s[:, None] * lam_safe)) / lam_safe
+        return torch.where(zero, 2.0 * (self.sigma**2) * s[:, None], var_eig)  # (B,N)
+
     @torch.no_grad()
     def marginal_sampling(self, x0, t):
         if t.dim() == 0:
@@ -218,16 +262,39 @@ class GASDE:
         z0 = x0 @ self.U                                                   # (B,N)
         decay = torch.exp(-s[:, None] * self.lam[None, :])                 # (B,N)
         mu_eig = (decay * z0)                                              # (B,N)
-        var_eig = (self.sigma**2) * (1.0 - torch.exp(-2.0 * s[:, None] * self.lam[None, :])) / self.lam[None, :]  # (B,N)
+        var_eig = self._var_eig(s)                                         # (B,N)
 
         eps = torch.randn_like(var_eig)
         z_t = mu_eig + torch.sqrt(var_eig.clamp_min(0)) * eps
         return z_t @ self.U.T
 
+    def score(self, x, t, x0_hat):
+        # Score of p(x_t | x_0) evaluated at the denoiser estimate x0_hat, computed in the graph spectral domain
+        if t.dim() == 0:
+            t = t.repeat(x.shape[0])
+        s = self._s_of_t(t).to(x)                             # (B,)
+
+        z_t   = x @ self.U                                    # (B, N)
+        z_hat = x0_hat @ self.U                               # (B, N)
+
+        decay   = torch.exp(- s[:, None] * self.lam[None, :]) # (B, N)
+        mu_eig  = decay * z_hat                               # (B, N)
+        diff_eig = z_t - mu_eig                               # (B, N)
+
+        var_eig = self._var_eig(s)                            # (B, N)
+        inv_var = 1.0 / var_eig.clamp_min(1e-12)
+
+        score_eig = - diff_eig * inv_var                      # (B, N)
+        return score_eig @ self.U.T                           # (B, N)
+
     def prior_sampling(self, shape):
         B, N = shape
         z = torch.randn(B, N, device=self.device, dtype=torch.float32)
-        x_eig = z * (self.sigma / torch.sqrt(self.lam)).view(1, -1)
+        # Stationary GMRF sigma^2 / lam per mode; modes without drift (lam = 0) use the marginal at T, 2 sigma^2 S
+        zero = self.lam <= 1e-6
+        lam_safe = torch.where(zero, torch.ones_like(self.lam), self.lam)
+        std_eig = torch.where(zero, math.sqrt(2.0 * self.S) * self.sigma, self.sigma / torch.sqrt(lam_safe))
+        x_eig = z * std_eig.view(1, -1)
         return x_eig @ self.U.T
 
     @torch.no_grad()

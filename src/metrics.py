@@ -1,4 +1,4 @@
-# signal_metrics.py
+# metrics.py
 from __future__ import annotations
 
 import math
