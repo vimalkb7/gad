@@ -1,0 +1,14 @@
+# Project specific
+legacy/
+data/
+checkpoints/
+results/
+venv/
+*.ipynb
+nohup*
+*.out
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
